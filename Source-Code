@@ -1,0 +1,558 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <LittleFS.h>
+#include <time.h>
+#include "AudioFileSourceLittleFS.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
+
+#include <SPI.h>
+#include <GxEPD2_BW.h>
+#include <Fonts/FreeSans9pt7b.h>
+
+// ================= WIFI =================
+#define WIFI_SSID     "yourwifiname"
+#define WIFI_PASSWORD "yourwifipassword"
+
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 19800
+
+#define MAX_REMINDERS 10
+
+// ================= AUDIO =================
+// GPIO 25 = Internal DAC Channel 1 (Left)  → Speaker+ (via 10µF cap)
+// GPIO 26 = Internal DAC Channel 2 (Right) → Speaker- (differential mode)
+// GND → Speaker GND
+
+AudioOutputI2S *out = nullptr;
+
+// ================= EPAPER =================
+#define EPD_CS   5
+#define EPD_DC   17
+#define EPD_RST  16
+#define EPD_BUSY 4
+#define EPD_MOSI 23
+#define EPD_SCK  18
+
+GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT>
+display(GxEPD2_154_D67(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
+
+// ================= WEB SERVER =================
+WebServer server(80);
+
+// ================= REMINDER =================
+struct Reminder {
+  String text;
+  String file;
+  int hour;
+  int minute;
+  bool played;
+};
+
+Reminder reminders[MAX_REMINDERS];
+int reminderCount = 0;
+
+// ================= WEBPAGE =================
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Smart Reminder</title>
+<style>
+body{
+  background:#111827;
+  font-family:Arial;
+  color:white;
+  padding:20px;
+}
+h1{
+  text-align:center;
+  color:#60a5fa;
+}
+.clock{
+  font-size:40px;
+  text-align:center;
+  margin:20px;
+  color:#facc15;
+}
+.card{
+  background:#1f2937;
+  padding:20px;
+  border-radius:15px;
+  margin:auto;
+  max-width:500px;
+}
+input{
+  width:100%;
+  padding:12px;
+  margin-top:10px;
+  border:none;
+  border-radius:10px;
+  font-size:16px;
+  box-sizing:border-box;
+}
+button{
+  width:100%;
+  padding:12px;
+  margin-top:10px;
+  background:#2563eb;
+  border:none;
+  color:white;
+  border-radius:10px;
+  font-size:16px;
+  cursor:pointer;
+}
+button:hover{
+  background:#1d4ed8;
+}
+.rem{
+  background:#374151;
+  padding:15px;
+  border-radius:10px;
+  margin-top:10px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.del{
+  background:#dc2626;
+  width:auto;
+  padding:8px 15px;
+}
+.status{
+  text-align:center;
+  margin-top:15px;
+  color:#facc15;
+}
+</style>
+</head>
+<body>
+<h1>ESP32 Smart Reminder</h1>
+<div class="clock" id="clock">--:--:--</div>
+<div class="card">
+  <input type="text" id="text" placeholder="Reminder text">
+  <input type="time" id="time">
+  <button onclick="addReminder()">Add Reminder</button>
+  <button onclick="testAudio()">Test Audio</button>
+  <div class="status" id="status"></div>
+</div>
+<div id="list" style="max-width:500px;margin:auto;margin-top:10px;"></div>
+
+<script>
+function updateClock(){
+  fetch('/time')
+    .then(r=>r.text())
+    .then(t=>{ document.getElementById('clock').innerHTML=t; });
+}
+setInterval(updateClock,1000);
+updateClock();
+
+function loadReminders(){
+  fetch('/list')
+    .then(r=>r.json())
+    .then(data=>{
+      let html='';
+      data.forEach((r,i)=>{
+        html += `<div class="rem">
+          <div><b>${r.time}</b><br>${r.text}</div>
+          <button class="del" onclick="delRem(${i})">Delete</button>
+        </div>`;
+      });
+      document.getElementById('list').innerHTML=html;
+    });
+}
+
+function addReminder(){
+  let text=document.getElementById('text').value;
+  let time=document.getElementById('time').value;
+  if(text=='' || time==''){
+    alert('Enter reminder text and time');
+    return;
+  }
+  document.getElementById('status').innerHTML='Generating voice...';
+  fetch('/add',{
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'text='+encodeURIComponent(text)+'&time='+time
+  })
+  .then(r=>r.text())
+  .then(d=>{
+    document.getElementById('status').innerHTML=d;
+    document.getElementById('text').value='';
+    loadReminders();
+  });
+}
+
+function delRem(i){
+  fetch('/delete?id='+i).then(()=>{ loadReminders(); });
+}
+
+function testAudio(){
+  document.getElementById('status').innerHTML='Testing audio...';
+  fetch('/test')
+    .then(r=>r.text())
+    .then(d=>{ document.getElementById('status').innerHTML=d; });
+}
+
+loadReminders();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ================= EPD DISPLAY =================
+void showReminderOnEPD(String text) {
+  Serial.println("Updating ePaper...");
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(10, 25);
+    display.println("CURRENT REMINDER");
+    display.drawLine(0, 35, 200, 35, GxEPD_BLACK);
+
+    int y = 65;
+    String word = "";
+    String line = "";
+
+    for (int i = 0; i <= (int)text.length(); i++) {
+      char c = (i < (int)text.length()) ? text[i] : ' ';
+      if (c == ' ' || i == (int)text.length()) {
+        if ((line + word).length() > 18) {
+          display.setCursor(10, y);
+          display.println(line);
+          y += 22;
+          line = word + " ";
+        } else {
+          line += word + " ";
+        }
+        word = "";
+      } else {
+        word += c;
+      }
+    }
+    if (line.length() > 0) {
+      display.setCursor(10, y);
+      display.println(line);
+    }
+  } while (display.nextPage());
+  display.hibernate();
+  Serial.println("ePaper updated");
+}
+
+// ================= AUDIO PLAYBACK =================
+void playMP3(String path) {
+  Serial.println("\n▶ playMP3: " + path);
+
+  if (!LittleFS.exists(path)) {
+    Serial.println("✗ File not found: " + path);
+    return;
+  }
+
+  File check = LittleFS.open(path, "r");
+  if (!check) { Serial.println("✗ Cannot open file"); return; }
+  int fileSize = check.size();
+  check.close();
+  Serial.println("  File size: " + String(fileSize) + " bytes");
+
+  if (fileSize < 512) {
+    Serial.println("✗ File too small (" + String(fileSize) + " bytes)");
+    return;
+  }
+
+  // ── Keep 'out' alive across calls — deleting/recreating the I2S driver ──
+  // repeatedly causes DMA state corruption. Create once, reuse always.
+  if (!out) {
+    out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
+    // ❌ DO NOT call SetOutputModeMono(true)
+    //    Mono mode maps to I2S_CHANNEL_FMT_ONLY_RIGHT which drives GPIO26 (DAC2).
+    //    Your speaker is on GPIO25 (DAC1 = left channel).
+    //    Stereo mode (default) uses I2S_CHANNEL_FMT_RIGHT_LEFT → drives BOTH
+    //    GPIO25 and GPIO26, so GPIO25 gets audio.
+    out->SetGain(1.0);  // 4.0 was clipping — start at 1.0, raise if too quiet
+  }
+
+  AudioFileSourceLittleFS *fsFile = new AudioFileSourceLittleFS(path.c_str());
+  AudioGeneratorMP3      *decoder = new AudioGeneratorMP3();
+
+  Serial.println("  Starting decoder...");
+  if (decoder->begin(fsFile, out)) {
+    Serial.println("  Decoder started — playing...");
+
+    // ── FIX: Push 1 second of silence to let the DAC pop/startup settle ─────
+    // When the I2S DAC starts, it jumps to 1.65V DC bias, causing a pop.
+    // By playing silence first, we give the speaker time to settle so the 
+    // first word of the voice isn't masked by the hardware transient.
+    int16_t silence[2] = {0, 0};
+    for (int i = 0; i < 24000; i++) { // 24000 samples @ 24kHz = 1 second
+      out->ConsumeSample(silence);
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
+    int loopCount  = 0;
+    int failCount  = 0;
+    while (decoder->isRunning()) {
+      bool ok = decoder->loop();
+      if (ok) {
+        loopCount++;
+        failCount = 0;          // reset consecutive-fail counter
+      } else {
+        failCount++;
+        Serial.println("  loop() false at loopCount=" + String(loopCount)
+                       + " failCount=" + String(failCount));
+        decoder->stop();
+        break;
+      }
+      if (loopCount % 2000 == 0)
+        Serial.println("  Playing... loops=" + String(loopCount));
+      yield();
+    }
+    Serial.println("✓ MP3 done. loops=" + String(loopCount));
+  } else {
+    Serial.println("✗ decoder->begin() failed");
+  }
+
+  delete decoder;
+  delete fsFile;
+  Serial.println("  Resources freed\n");
+}
+
+// ================= TTS DOWNLOAD =================
+bool downloadTTS(String text, String filename) {
+  String encoded = "";
+  for (int i = 0; i < (int)text.length(); i++) {
+    char c = text[i];
+    if (c == ' ') {
+      encoded += '+';
+    } else if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    } else {
+      char buf[4];
+      sprintf(buf, "%%%02X", (unsigned char)c);
+      encoded += buf;
+    }
+  }
+
+  String url = "http://translate.google.com/translate_tts?ie=UTF-8&tl=en-US&client=tw-ob&ttsspeed=0.8&q=" + encoded;
+  Serial.println("TTS URL: " + url);
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+  http.setTimeout(15000);
+
+  int code = http.GET();
+  Serial.println("HTTP Code: " + String(code));
+
+  if (code != HTTP_CODE_OK) {
+    Serial.println("TTS HTTP failed: " + String(code));
+    http.end();
+    return false;
+  }
+
+  Serial.println("Content-Length: " + String(http.getSize()));
+
+  // ── KEY FIX: writeToStream() handles chunked transfer encoding ────────────
+  // getStreamPtr() returns raw TCP bytes — for chunked responses Google sends,
+  // this includes hex chunk-size lines (e.g. "4140\r\n") BEFORE the MP3 data.
+  // writeToStream() strips those chunk headers automatically, giving clean
+  // binary MP3 data to the file.
+  // ──────────────────────────────────────────────────────────────────────────
+  File file = LittleFS.open(filename, "w");
+  if (!file) {
+    Serial.println("File create failed: " + filename);
+    http.end();
+    return false;
+  }
+
+  int totalBytes = http.writeToStream(&file);   // handles chunked + plain
+  file.close();
+  http.end();
+
+  Serial.println("Downloaded: " + String(totalBytes) + " bytes");
+
+  if (totalBytes < 512) {
+    Serial.println("✗ Too small (" + String(totalBytes) + " bytes) — invalid audio");
+    LittleFS.remove(filename);
+    return false;
+  }
+
+  // Verify MP3 sync word / ID3 tag in first 4 bytes
+  File verify = LittleFS.open(filename, "r");
+  if (verify) {
+    uint8_t header[4];
+    verify.readBytes((char*)header, 4);
+    verify.close();
+    bool isMP3 = (header[0] == 0xFF && (header[1] & 0xE0) == 0xE0);
+    bool isID3 = (header[0] == 'I' && header[1] == 'D' && header[2] == '3');
+    if (!isMP3 && !isID3) {
+      Serial.printf("✗ Bad MP3 header: %02X %02X %02X %02X\n",
+                    header[0], header[1], header[2], header[3]);
+      LittleFS.remove(filename);
+      return false;
+    }
+    Serial.println("✓ MP3 header OK");
+  }
+
+  Serial.println("TTS saved: " + filename);
+  return true;
+}
+
+// ================= WEB HANDLERS =================
+void handleRoot() { server.send_P(200, "text/html", webpage); }
+
+void handleTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) { server.send(200, "text/plain", "--:--:--"); return; }
+  char buf[20];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+  server.send(200, "text/plain", buf);
+}
+
+void handleList() {
+  String json = "[";
+  for (int i = 0; i < reminderCount; i++) {
+    if (i > 0) json += ",";
+    char t[10];
+    sprintf(t, "%02d:%02d", reminders[i].hour, reminders[i].minute);
+    json += "{\"time\":\""; json += t;
+    json += "\",\"text\":\""; json += reminders[i].text; json += "\"}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleAdd() {
+  if (reminderCount >= MAX_REMINDERS) {
+    server.send(200, "text/plain", "Max reminders reached"); return;
+  }
+  String text = server.arg("text");
+  String time = server.arg("time");
+  if (text.length() == 0 || time.length() < 5) {
+    server.send(200, "text/plain", "Invalid input"); return;
+  }
+  int h = time.substring(0, 2).toInt();
+  int m = time.substring(3, 5).toInt();
+  String fileName = "/audio/rem" + String(reminderCount) + ".mp3";
+  if (LittleFS.exists(fileName)) LittleFS.remove(fileName);
+
+  bool ok = downloadTTS(text, fileName);
+  if (!ok) { server.send(200, "text/plain", "TTS Download Failed — check Serial"); return; }
+
+  reminders[reminderCount] = { text, fileName, h, m, false };
+  reminderCount++;
+  server.send(200, "text/plain", "Reminder Added!");
+}
+
+void handleDelete() {
+  int id = server.arg("id").toInt();
+  if (id < 0 || id >= reminderCount) { server.send(200, "text/plain", "Invalid ID"); return; }
+  LittleFS.remove(reminders[id].file);
+  for (int i = id; i < reminderCount - 1; i++) reminders[i] = reminders[i + 1];
+  reminderCount--;
+  server.send(200, "text/plain", "Deleted");
+}
+
+void handleTest() {
+  String path = "/audio/test.mp3";
+  if (LittleFS.exists(path)) LittleFS.remove(path);
+  bool ok = downloadTTS("Audio is working perfectly", path);
+  if (ok) {
+    playMP3(path);
+    LittleFS.remove(path);
+    server.send(200, "text/plain", "Audio OK — did you hear it?");
+  } else {
+    server.send(200, "text/plain", "TTS download failed — check WiFi and Serial");
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nESP32 Smart Reminder Starting...");
+
+  if (!LittleFS.begin(true)) { Serial.println("LittleFS mount failed!"); return; }
+  if (!LittleFS.exists("/audio")) LittleFS.mkdir("/audio");
+  Serial.println("LittleFS OK");
+
+  SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
+  display.init(115200, true, 2, false);
+  display.setRotation(1);
+  display.setTextColor(GxEPD_BLACK);
+  display.setFont(&FreeSans9pt7b);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setCursor(10, 40); display.println("SMART REMINDER");
+    display.setCursor(10, 70); display.println("Starting...");
+  } while (display.nextPage());
+  display.hibernate();
+  Serial.println("ePaper OK");
+
+  // ── AUDIO INIT ────────────────────────────────────────────────────────────
+  // Created here so it persists for the entire session. The out object is
+  // NOT deleted between playbacks — recreating it corrupts the I2S DMA state.
+  // SetOutputModeMono(true) is intentionally OMITTED: mono mode selects
+  // I2S_CHANNEL_FMT_ONLY_RIGHT (GPIO26/DAC2). Speaker is on GPIO25 (DAC1).
+  // Stereo mode selects I2S_CHANNEL_FMT_RIGHT_LEFT → GPIO25 gets audio.
+  // ─────────────────────────────────────────────────────────────────────────
+  out = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
+  out->SetGain(1.0);  // Start conservative; increase to 2.0 if too quiet
+  Serial.println("Audio init OK — GPIO25=DAC1(L)  GPIO26=DAC2(R)");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500); Serial.print("."); tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi failed!");
+  }
+
+  configTime(GMT_OFFSET_SEC, 0, NTP_SERVER);
+  Serial.println("NTP configured");
+
+  server.on("/",       handleRoot);
+  server.on("/time",   handleTime);
+  server.on("/list",   handleList);
+  server.on("/add",    HTTP_POST, handleAdd);
+  server.on("/delete", handleDelete);
+  server.on("/test",   handleTest);
+  server.begin();
+  Serial.println("Web server started");
+  Serial.println("Open: http://" + WiFi.localIP().toString());
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 5000) {
+    lastCheck = millis();
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      for (int i = 0; i < reminderCount; i++) {
+        if (!reminders[i].played &&
+             reminders[i].hour   == timeinfo.tm_hour &&
+             reminders[i].minute == timeinfo.tm_min) {
+          reminders[i].played = true;
+          Serial.println("=== REMINDER TRIGGERED: " + reminders[i].text);
+          showReminderOnEPD(reminders[i].text);
+          playMP3(reminders[i].file);
+        }
+      }
+      if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0)
+        for (int i = 0; i < reminderCount; i++) reminders[i].played = false;
+    }
+  }
+}
