@@ -64,7 +64,4 @@ The core of the system is the ESP32, communicating with the e-paper display via 
 ## Conclusion
 This dedicated hardware device provides clear voice announcements and visual reminders through an e-paper display. It is perfect for elderly individuals, those with memory difficulties, study environments, or situations where phone usage is restricted.
 
-## Credits & Links
-- **Source Code & Documentation**: [Circuit Digest GitHub Repository](https://github.com/Circuit-Digest/Smart-Reminder-Using-ESP32/tree/main)
-- **Design Files**: [Canva Design](https://www.canva.com/design/DAHMDsx3zGo/A2yDIVDAwARZH_AUcvD1rg/edit)
-```
+
